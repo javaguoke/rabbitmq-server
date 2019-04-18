@@ -54,8 +54,9 @@ groups() ->
                                             add_member_not_found,
                                             delete_member_not_running,
                                             delete_member_classic,
-                                            delete_member_not_found,
-                                            delete_member]
+                                            delete_member_queue_not_found,
+                                            delete_member,
+                                            delete_member_not_a_member]
                        ++ all_tests()},
                       {cluster_size_2, [], memory_tests()},
                       {cluster_size_3, [], [
@@ -114,7 +115,16 @@ all_tests() ->
      queue_length_limit_drop_head,
      subscribe_redelivery_limit,
      subscribe_redelivery_policy,
-     subscribe_redelivery_limit_with_dead_letter
+     subscribe_redelivery_limit_with_dead_letter,
+     queue_length_in_memory_limit_basic_get,
+     queue_length_in_memory_limit_subscribe,
+     queue_length_in_memory_limit,
+     queue_length_in_memory_limit_returns,
+     queue_length_in_memory_bytes_limit_basic_get,
+     queue_length_in_memory_bytes_limit_subscribe,
+     queue_length_in_memory_bytes_limit,
+     queue_length_in_memory_purge,
+     in_memory
     ].
 
 memory_tests() ->
@@ -1228,7 +1238,8 @@ add_member_already_a_member(Config) ->
     QQ = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', QQ, 0, 0},
                  declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
-    ?assertEqual({error, already_a_member},
+    %% idempotent by design
+    ?assertEqual(ok,
                  rpc:call(Server, rabbit_quorum_queue, add_member,
                           [<<"/">>, QQ, Server])).
 
@@ -1266,7 +1277,8 @@ delete_member_not_running(Config) ->
     QQ = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', QQ, 0, 0},
                  declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
-    ?assertEqual({error, node_not_running},
+    %% it should be possible to delete members that are not online (e.g. decomissioned)
+    ?assertEqual(ok,
                  rpc:call(Server, rabbit_quorum_queue, delete_member,
                           [<<"/">>, QQ, 'rabbit@burrow'])).
 
@@ -1279,7 +1291,7 @@ delete_member_classic(Config) ->
                  rpc:call(Server, rabbit_quorum_queue, delete_member,
                           [<<"/">>, CQ, Server])).
 
-delete_member_not_found(Config) ->
+delete_member_queue_not_found(Config) ->
     [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
     QQ = ?config(queue_name, Config),
     ?assertEqual({error, not_found},
@@ -1295,11 +1307,22 @@ delete_member(Config) ->
     timer:sleep(100),
     ?assertEqual(ok,
                  rpc:call(Server, rabbit_quorum_queue, delete_member,
-                          [<<"/">>, QQ, Server])),
-    ?assertEqual({error, not_a_member},
-                 rpc:call(Server, rabbit_quorum_queue, delete_member,
                           [<<"/">>, QQ, Server])).
 
+delete_member_not_a_member(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+    timer:sleep(100),
+    ?assertEqual(ok,
+                 rpc:call(Server, rabbit_quorum_queue, delete_member,
+                          [<<"/">>, QQ, Server])),
+    %% idempotent by design
+    ?assertEqual(ok,
+                 rpc:call(Server, rabbit_quorum_queue, delete_member,
+                          [<<"/">>, QQ, Server])).
 
 cleanup_data_dir(Config) ->
     %% This test is slow, but also checks that we handle properly errors when
@@ -1812,6 +1835,321 @@ queue_length_limit_drop_head(Config) ->
                  amqp_channel:call(Ch, #'basic.get'{queue = QQ,
                                                     no_ack = true})).
 
+queue_length_in_memory_limit_basic_get(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-length">>, long, 1}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{routing_key = QQ},
+                           #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
+                                     payload = Msg1}),
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{routing_key = QQ},
+                           #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
+                                     payload = <<"msg2">>}),
+
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+
+    ?assertEqual([{1, byte_size(Msg1)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = Msg1}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = true})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = true})).
+
+queue_length_in_memory_limit_subscribe(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-length">>, long, 1}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    Msg2 = <<"msg11">>,
+    publish(Ch, QQ, Msg1),
+    publish(Ch, QQ, Msg2),
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+
+    ?assertEqual([{1, byte_size(Msg1)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    subscribe(Ch, QQ, false),
+    receive
+        {#'basic.deliver'{delivery_tag = DeliveryTag1,
+                          redelivered  = false},
+         #amqp_msg{payload = Msg1}} ->
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag1,
+                                               multiple     = false})
+    end, 
+    ?assertEqual([{0, 0}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+    receive
+        {#'basic.deliver'{delivery_tag = DeliveryTag2,
+                          redelivered  = false},
+         #amqp_msg{payload = Msg2}} ->
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag2,
+                                               multiple     = false})
+    end.
+
+queue_length_in_memory_limit(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-length">>, long, 2}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    Msg2 = <<"msg11">>,
+    Msg3 = <<"msg111">>,
+    Msg4 = <<"msg1111">>,
+
+    publish(Ch, QQ, Msg1),
+    publish(Ch, QQ, Msg2),
+    publish(Ch, QQ, Msg3),
+    wait_for_messages(Config, [[QQ, <<"3">>, <<"3">>, <<"0">>]]),
+
+    ?assertEqual([{2, byte_size(Msg1) + byte_size(Msg2)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = Msg1}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = true})),
+
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+    publish(Ch, QQ, Msg4),
+    wait_for_messages(Config, [[QQ, <<"3">>, <<"3">>, <<"0">>]]),
+
+    ?assertEqual([{2, byte_size(Msg2) + byte_size(Msg4)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)).
+
+queue_length_in_memory_limit_returns(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-length">>, long, 2}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    Msg2 = <<"msg11">>,
+    Msg3 = <<"msg111">>,
+    Msg4 = <<"msg111">>,
+    publish(Ch, QQ, Msg1),
+    publish(Ch, QQ, Msg2),
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+
+    ?assertEqual([{2, byte_size(Msg1) + byte_size(Msg2)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = Msg1}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = false})),
+
+    {#'basic.get_ok'{delivery_tag = DTag2}, #amqp_msg{payload = Msg2}} =
+        amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                           no_ack = false}),
+
+    publish(Ch, QQ, Msg3),
+    publish(Ch, QQ, Msg4),
+
+    %% Ensure that returns are subject to in memory limits too
+    wait_for_messages(Config, [[QQ, <<"4">>, <<"2">>, <<"2">>]]),
+    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = DTag2,
+                                        multiple     = true,
+                                        requeue      = true}),
+    wait_for_messages(Config, [[QQ, <<"4">>, <<"4">>, <<"0">>]]),
+
+    ?assertEqual([{2, byte_size(Msg3) + byte_size(Msg4)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)).
+
+queue_length_in_memory_bytes_limit_basic_get(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-bytes">>, long, 6}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{routing_key = QQ},
+                           #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
+                                     payload = Msg1}),
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{routing_key = QQ},
+                           #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
+                                     payload = <<"msg2">>}),
+
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+
+    ?assertEqual([{1, byte_size(Msg1)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = Msg1}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = true})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = true})).
+
+queue_length_in_memory_bytes_limit_subscribe(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-bytes">>, long, 6}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    Msg2 = <<"msg11">>,
+    publish(Ch, QQ, Msg1),
+    publish(Ch, QQ, Msg2),
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+
+    ?assertEqual([{1, byte_size(Msg1)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    subscribe(Ch, QQ, false),
+    receive
+        {#'basic.deliver'{delivery_tag = DeliveryTag1,
+                          redelivered  = false},
+         #amqp_msg{payload = Msg1}} ->
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag1,
+                                               multiple     = false})
+    end, 
+    ?assertEqual([{0, 0}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+    receive
+        {#'basic.deliver'{delivery_tag = DeliveryTag2,
+                          redelivered  = false},
+         #amqp_msg{payload = Msg2}} ->
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag2,
+                                               multiple     = false})
+    end.
+
+queue_length_in_memory_bytes_limit(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-bytes">>, long, 12}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    Msg2 = <<"msg11">>,
+    Msg3 = <<"msg111">>,
+    Msg4 = <<"msg1111">>,
+
+    publish(Ch, QQ, Msg1),
+    publish(Ch, QQ, Msg2),
+    publish(Ch, QQ, Msg3),
+    wait_for_messages(Config, [[QQ, <<"3">>, <<"3">>, <<"0">>]]),
+
+    ?assertEqual([{2, byte_size(Msg1) + byte_size(Msg2)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = Msg1}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = true})),
+
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+    publish(Ch, QQ, Msg4),
+    wait_for_messages(Config, [[QQ, <<"3">>, <<"3">>, <<"0">>]]),
+
+    ?assertEqual([{2, byte_size(Msg2) + byte_size(Msg4)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)).
+
+queue_length_in_memory_purge(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-in-memory-length">>, long, 2}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    Msg2 = <<"msg11">>,
+    Msg3 = <<"msg111">>,
+
+    publish(Ch, QQ, Msg1),
+    publish(Ch, QQ, Msg2),
+    publish(Ch, QQ, Msg3),
+    wait_for_messages(Config, [[QQ, <<"3">>, <<"3">>, <<"0">>]]),
+
+    ?assertEqual([{2, byte_size(Msg1) + byte_size(Msg2)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    {'queue.purge_ok', 3} = amqp_channel:call(Ch, #'queue.purge'{queue = QQ}),
+
+    ?assertEqual([{0, 0}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)).
+
+in_memory(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+
+    RaName = ra_name(QQ),
+    Msg1 = <<"msg1">>,
+    Msg2 = <<"msg11">>,
+
+    publish(Ch, QQ, Msg1),
+
+    wait_for_messages(Config, [[QQ, <<"1">>, <<"1">>, <<"0">>]]),
+    ?assertEqual([{1, byte_size(Msg1)}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    subscribe(Ch, QQ, false),
+    
+    wait_for_messages(Config, [[QQ, <<"1">>, <<"0">>, <<"1">>]]),
+    ?assertEqual([{0, 0}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    publish(Ch, QQ, Msg2),
+
+    wait_for_messages(Config, [[QQ, <<"2">>, <<"0">>, <<"2">>]]),
+    ?assertEqual([{0, 0}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)),
+
+    receive
+        {#'basic.deliver'{delivery_tag = DeliveryTag}, #amqp_msg{}} ->
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag,
+                                               multiple     = false})
+    end,
+
+    wait_for_messages(Config, [[QQ, <<"1">>, <<"0">>, <<"1">>]]),
+    ?assertEqual([{0, 0}],
+                 dirty_query([Server], RaName, fun rabbit_fifo:query_in_memory_usage/1)).
+
 %%----------------------------------------------------------------------------
 
 declare(Ch, Q) ->
@@ -1836,10 +2174,13 @@ publish_many(Ch, Queue, Count) ->
     [publish(Ch, Queue) || _ <- lists:seq(1, Count)].
 
 publish(Ch, Queue) ->
+    publish(Ch, Queue, <<"msg">>).
+
+publish(Ch, Queue, Msg) ->
     ok = amqp_channel:cast(Ch,
                            #'basic.publish'{routing_key = Queue},
                            #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
-                                     payload = <<"msg">>}).
+                                     payload = Msg}).
 
 consume(Ch, Queue, NoAck) ->
     {GetOk, _} = Reply = amqp_channel:call(Ch, #'basic.get'{queue = Queue,
